@@ -1,0 +1,332 @@
+library(fitzRoy)
+library(dplyr)
+library(stringr)
+library(randomForest)
+library(caret)
+library(purrr)
+library(tidymodels)
+library(ranger)
+
+#Data Extraction
+afl_data <- fitzRoy::fetch_results_afltables(season = 2023)
+afl_data_df <- as.data.frame(afl_data)
+afl_data_final <- select(afl_data_df,
+                         'Round','Home.Team','Home.Points','Away.Team','Away.Points',
+                         'Margin',"Round.Number")
+
+#DAta Cleaning
+#Checking for any empty or missing values & Cleaning data dor models 
+afl_data_final[afl_data_final == ""] <- NA
+any(is.na(afl_data_final))
+
+#afl_data_final <- afl_data_final %>%
+# mutate(round_number = as.numeric(str_extract(Round, "\\d+")))
+
+afl_data_final <- afl_data_final %>% mutate(score = case_when(
+  Margin > 0 ~ 1,   # Home team wins
+  Margin < 0 ~ 0,   # Away team wins
+  TRUE ~ 0.5        # Draw
+))
+
+#changing final rounds to r14 format for model to run and predict in random forest
+final_rounds_afl <- c('R25','R25','R25','R25','R26','R26','R27','R27','R28')
+
+
+#Splitting the training and testing data
+train_random_data <- afl_data_final 
+
+test_random_data <- afl_data_final %>% filter(Round %in% c("QF","EF","SF","PF","GF"))
+
+#test_random_data <- test_random_data %>%
+# mutate(Round = case_when(
+#  Round %in% c('QF', 'EF') ~ 'R25',
+# Round == 'SF' ~ 'R26',
+#Round == 'PF' ~ 'R27',
+#Round == 'GF' ~ 'R28',
+#TRUE ~ Round  # This leaves the value of 'Round' as is if it doesn't match any of the above conditions
+#))
+
+
+#Using Random forest model
+rf_spec <- rand_forest() %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+#fitting the training data
+rf_fit <- rf_spec %>% fit(score ~ ., data = train_random_data)
+
+rf_fit %>% extract_fit_engine()
+
+#training analysis and predictions 
+
+# Training (rsq)
+results_rsq_train <- rf_fit %>% 
+  augment(new_data = train_random_data) %>% 
+  rsq(score, .pred)
+
+
+#prediction <- predict(rf_fit,new_data = test_random_data)
+
+
+# Testing (rsq)
+results_rsq_test <- rf_fit %>% 
+  augment(new_data = test_random_data) %>% 
+  rsq(score, .pred)
+
+
+#To avoid overfitting we are doing following steps
+
+data_folds = vfold_cv(train_random_data)
+
+rf_results <- fit_resamples(
+  rf_spec,
+  score ~ .,
+  data_folds,
+  control = control_resamples(save_pred = T)
+)
+
+rf_results %>% collect_metrics()
+
+# Plot
+rf_results %>%
+  unnest(.predictions) %>%
+  ggplot(aes(score, .pred)) +
+  geom_point(alpha = .5) +
+  geom_abline()
+
+#Hyperparameter tuning for random forest
+
+# Create new spec
+rf_spec2 <- rand_forest(mtry = tune(),
+                        trees = tune(),
+                        min_n = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("ranger")
+
+# Tune grid
+rf_tune_results <- tune_grid(
+  rf_spec2,
+  score ~ .,
+  resamples = data_folds,
+  grid = 10,
+  metrics = metric_set(rsq, rmse)
+)
+
+# Choose best model
+best_rmse <- select_best(rf_tune_results, "rmse")
+rf_spec_final <- finalize_model(rf_spec2, best_rmse)
+
+
+#Splitting for last test
+
+data_split <- initial_split(afl_data_final)
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+last_fit(rf_spec_final, 
+         score ~.,
+         data_split) %>% 
+  collect_metrics()
+
+data_train_check <- afl_data_final %>% filter(Round.Number <= 24) 
+
+#now finally running the model with best parameters and performing win-loss predictions
+
+model_random_check <- randomForest(score ~ ., data = data_train_check,
+                                   ntree = 353, mtry = 6) 
+
+
+data_test_check <- afl_data_final %>% filter(Round.Number > 24)%>% select(-score)
+
+#Prediction round by round
+
+prediction_check <- predict(model_random_check, newdata = data_test_check, type = "class")
+
+options(scipen = 999)
+print(round(prediction_check,1))
+
+
+predicted.classes_margin <- round(prediction_check,1)
+
+# for (round in test_random_data$Round){
+#   rounds_check_winloss <- data_test
+#   predicted.classes_margin <- model_random %>% 
+#     predict(rounds_check_winloss, type = "class")
+#   print(paste("Predictions for", round))
+#   print(predicted.classes_margin)
+# }
+
+predicted.classes_winloss_df <- data.frame(ID = c(1, 2, 3,4,5,6,7,8,9),
+                                           Predicted_Margin <-as.data.frame(predicted.classes_margin))
+rounds_final_df <-data.frame(ID = c(1, 2,3,4,5,6,7,8,9),Round =c("QF1",'EF1','EF2','QF2','SF1',
+                                                                 'SF2','PF1','PF2','GF'),
+                             Home_Team = test_random_data$Home.Team,
+                             Away_Team = test_random_data$Away.Team)
+#predictions_random <- predict(model_random, newdata = test_random_data %>% select(-'score'), type = "class")
+
+#Final winloss table
+final_winloss_table <-rounds_final_df %>% 
+  inner_join(predicted.classes_winloss_df, by = "ID")
+
+
+#Confusion Matrix
+
+data_validate <- afl_data_final %>% filter(Round.Number>24)
+cm_winloss_random <- confusionMatrix(factor(predicted.classes_winloss_df$predicted.classes_margin, levels = c(1,0)), 
+                                     factor(data_validate$score , levels = c(1,0)))
+cm_winloss_random
+
+#Converting for R-shiny App
+cm_table <- cm_winloss_random$table
+cm_random_df <- as.data.frame(cm_table)
+
+stats <- cm_winloss_random$byClass
+stats_random_df <- as.data.frame(t(stats))
+
+#ROC PLOT
+roc_obj1 <- roc(final_winloss_table$predicted.classes_margin, data_validate$Margin)
+
+# Plot the ROC curve
+plot(roc_obj1, main="ROC Curve", col="blue", lwd=2)
+
+
+##now coding for Predictions of Margin using Random Forest Model
+margin_random_check <- randomForest(Margin ~ ., data = data_train_check,
+                                    ntree = 353, mtry = 6)
+
+data_test_margin <- afl_data_final %>% filter(Round.Number > 24)%>% select(-Margin)
+
+#Prediction round by round
+
+prediction_margin <- predict(margin_random_check, newdata = data_test_margin, type = "class")
+
+#rounding margins to one decimal places
+prediction_margin <- round(prediction_margin,0)
+
+
+
+predicted_margin_df <- data.frame(ID = c(1, 2, 3,4,5,6,7,8,9),
+                                  Predicted_Margin <-as.data.frame(prediction_margin))
+rounds_final_df <-data.frame(ID = c(1, 2,3,4,5,6,7,8,9),Round =c("QF1",'EF1','EF2','QF2','SF1',
+                                                                 'SF2','PF1','PF2','GF'),
+                             Home_Team = test_random_data$Home.Team,
+                             Away_Team = test_random_data$Away.Team)
+#predictions_random <- predict(model_random, newdata = test_random_data %>% select(-'score'), type = "class")
+
+#Final predicted margin table
+final_margin_table <-rounds_final_df %>% 
+  inner_join(predicted_margin_df, by = "ID")
+
+#Confusion Matrix
+margin_validate <- afl_data_final %>% filter(Round.Number>24)
+
+rmse_margin <- RMSE(final_margin_table$prediction_margin, margin_validate$Margin)
+r2_margin <- R2(final_margin_table$prediction_margin, margin_validate$Margin)
+
+final_marginrandom_df <- data.frame(ID=c(1,2),Measures = c('RMSE','R2'), value=c(rmse_margin,r2_margin))
+table_random_df <- data.frame(ID=c(1,2))
+
+final_random_margin_table <- table_random_df %>% inner_join(final_marginrandom_df)
+
+
+# Scatter Plot 
+ggplot(final_margin_table, aes(x = data_validate$Margin, y = prediction_margin)) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', col = "red", se = FALSE) + 
+  ggtitle("Actual vs. Predicted Values") +
+  xlab("Actual Margin") +
+  ylab("Predicted Margin") +
+  scale_x_continuous(limits = c(-5, 50)) + 
+  theme_minimal()
+
+---------------------------------------------------------------------- SHINY APP ------------------------------------------------------------------------------------------------------
+  # Load necessary libraries
+  library(shiny)
+library(fitzRoy)
+library(dplyr)
+library(stringr)
+library(elo)
+library(caret)
+library(ggplot2)
+#library(InformationValue)
+
+# Define the UI
+ui <- fluidPage(
+  titlePanel("AFL-Data Analysis for 2023"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      tags$div(style = "font-size:20px; font-weight:bold;
+               padding:10px; border: 1px solid black; text-align:center;", "RANDOM FORESTS PREDICTIONS")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Win-Loss Table", tableOutput("winLossTable")),
+        tabPanel("Margin Table", tableOutput("marginTable")),
+        #tabPanel("Elo Accuracy", verbatimTextOutput("eloAccuracy")),
+        #tabPanel("Logistic Accuracy", verbatimTextOutput("logisticAccuracy")),
+        tabPanel("WinLossGraph", plotOutput("graph")),
+        tabPanel("Win-Loss Accuracy", tableOutput("winlossAccuracy")),
+        tabPanel("Margin Accuracy", tableOutput("marginAccuracy")),
+        tabPanel("MarginGraph", plotOutput("graph2"))
+      )
+    )
+  )
+)
+
+# Define server logic
+server <- function(input, output) {
+  
+  # Since there are multiple outputs, use reactive function for chunks of codes that are reused
+  fetchData <- reactive({
+    # Your initial data processing code here...
+    # (everything up to eloratings$pred_elo <- ifelse(eloratings$p.A > 0.5, 1, 0))
+    
+    # Return eloratings
+    return(eloratings_optimal)
+  })
+  
+  output$winLossTable <- renderTable({
+    final_winloss_table 
+  })
+  
+  output$marginTable <- renderTable({
+    final_margin_table 
+  })
+  
+  output$winlossAccuracy <- renderTable({
+    cat("Confusion Matrix:\n")
+    print(cm_random_df)
+    cat("\n\n")
+    
+    cat("Statistics:\n")
+    print(stats_random_df)
+  })
+  
+  output$marginAccuracy <- renderTable({
+    final_random_margin_table
+    
+  })
+  
+  output$graph <- renderPlot({
+    ggplot(final_margin_table, aes(x = data_validate$Margin, y = prediction_margin)) + 
+      geom_point() + 
+      geom_smooth(method = 'lm', col = "red", se = FALSE) + 
+      ggtitle("Actual vs. Predicted Values") +
+      xlab("Actual Margin") +
+      ylab("Predicted Margin") +
+      scale_x_continuous(limits = c(-5, 50)) + 
+      theme_minimal()
+  })
+  
+  output$graph2 <- renderPlot({
+    plot(roc_obj, main="ROC Curve", col="blue", lwd=2)
+  })
+  
+  
+}
+
+
+# Run the application 
+shinyApp(ui = ui, server = server)
