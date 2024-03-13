@@ -1,0 +1,318 @@
+
+library(fitzRoy)
+library(dplyr)
+library(stringr)
+
+
+#Getting the AFL data for 2023 grouped by round
+
+afl_data <- fitzRoy::fetch_results_afltables(season = 2023)
+afl_data_df <- as.data.frame(afl_data)
+
+afl_data_final <- select(afl_data_df,'Round','Home.Team','Home.Points','Away.Team','Away.Points','Margin')
+
+#Checking for any empty or missing values & Cleaning data dor models 
+afl_data_final[afl_data_final == ""] <- NA
+any(is.na(afl_data_final))
+
+afl_data_final <- afl_data_final %>%
+  mutate(round_number = as.numeric(str_extract(Round, "\\d+")))
+
+
+#For ELo Models
+afl_data_final <- afl_data_final %>% mutate(score = case_when(
+  Margin > 0 ~ 1,   # Home team wins
+  Margin < 0 ~ 0,   # Away team wins
+  TRUE ~ 0.5        # Draw
+))
+
+library(elo)
+eloratings <- elo::elo.run(formula = score ~ Home.Team + Away.Team,
+                           data = afl_data_final,
+                           initial.elos = 2200,
+                           k = 27,
+                           history = T) %>% as.data.frame()
+eloratings
+
+eloratings$pred_elo <- ifelse(eloratings$p.A > 0.5, 1, 0)
+
+
+## Confusion matrix
+library(caret)
+cm <- caret::confusionMatrix(data = factor(eloratings$pred_elo, levels = c(0,0.5,1)),
+                             reference = factor(eloratings$wins.A, levels = c(0, 0.5,1)))
+
+cm$overall["Accuracy"]
+
+#splitting data based on rounds
+
+train.data <- subset(afl_data_final, round_number <= 12)
+test.data <- subset(afl_data_final, round_number > 12)
+
+## Hyperparameter Tuning
+
+# Define the ELO scoring function
+elo_score <- function(initial_elos, k, data) {
+  eloratings <- elo::elo.run(formula = score ~ Home.Team + Away.Team,
+                             data = data,
+                             initial.elos = initial_elos,
+                             k = k,
+                             history = T) %>% as.data.frame()
+  
+  eloratings$pred_elo <- ifelse(eloratings$p.A > 0.5, 1, 0)
+  
+  cm <- caret::confusionMatrix(data = factor(eloratings$pred_elo, levels = c(0,0.5,1)),
+                               reference = factor(eloratings$wins.A, levels = c(0, 0.5,1)))
+  
+  return(cm$overall["Accuracy"])
+}
+
+# Create a grid
+params <- expand.grid(init = seq(1000, 3000, by = 50),
+                      kfac = seq(10, 50, by = 5))
+
+# Apply function
+params$accuracy <- mapply(elo_score, params$init, params$kfac, MoreArgs = list(data = train.data))
+
+# What was the best combination? Was it unique?
+subset(params, accuracy == max(params$accuracy))
+
+# Test parameters 
+elo_score(2000, 15, test.data)
+
+## Brier Scores
+mean((eloratings$wins.A - eloratings$p.A)^2, na.rm = T)
+
+#now training the model with optimal values obtained from hyperparamter tunings but we will leave behind the finals round because
+#need to predict win loss and margin with elo models
+afl_data_final_elo <- afl_data_final %>% filter(round_number<=24)
+
+eloratings_optimal <- elo.run(formula = score ~ Home.Team + Away.Team,
+                              initial.elos = 2000,
+                              k = 15,
+                              data = afl_data_final) %>%
+  as.data.frame()
+
+#new prediction column
+eloratings_optimal$tip_elo <- ifelse(eloratings_optimal$p.A > 0.5, 1, 0)
+
+afl_data_final$D.Rate <- eloratings_optimal$elo.A - eloratings_optimal$elo.B
+
+#Using elo ratings to predict for final series based on rounds
+test_data_elo <- afl_data_final %>% filter(Round %in% c("QF","EF","SF","PF","GF")) %>% 
+  select(-score)
+validate_results_data <- afl_data_final %>% filter(Round %in% c("QF","EF","SF","PF","GF")) %>% 
+  select(score)
+
+#predicting the win loss model using the data elo as done in the first excluding the final series
+#Building Logitic Regression Model
+## Build Logistic Regression model
+
+model1 <- glm(score ~ D.Rate, data = afl_data_final, family = "binomial")
+summary(model1)
+
+#Plotting the model run
+afl_data_final %>%
+  filter(score != 0.5) %>%
+  ggplot(aes(D.Rate, score)) +
+  geom_point(alpha = 0.1) +
+  stat_smooth(method = "glm",
+              method.args = list(family = "binomial"),
+              se = F)
+
+#Making round by round prediction
+
+for (round in test_data_elo$Round){
+  rounds_check <- test_data_elo %>% filter(Round == Round)
+  probabilities <- model1 %>% predict(rounds_check, type = "response")
+  predicted.classes <- ifelse(probabilities > .5, 1, 0)
+  print(paste("Predictions for", round))
+  
+  print(predicted.classes)
+}
+predicted.classes_df <- data.frame(ID = c(1, 2, 3,4,5,6,7,8,9),
+                                   Predicted_Class <-as.data.frame(predicted.classes))
+rounds_final_df <-data.frame(ID = c(1, 2, 3,4,5,6,7,8,9),Round =c("QF1",'EF1','EF2','QF2','SF1',
+                                                                  'SF2','PF1','PF2','GF'),Home_Team = test_data_elo$Home.Team,
+                             Away_Team = test_data_elo$Away.Team)
+
+#Final win loss table using logistic regression
+final_winloss_table <-rounds_final_df %>% inner_join(predicted.classes_df, by = "ID")
+
+as.data.frame(validate_results_data)
+
+#checking accuracy
+mean(predicted.classes == validate_results_data)
+
+#confusion matrix for this model
+cm_winloss_logistic <- confusionMatrix(factor(predicted.classes, levels = c(1,0)), 
+                                       factor(t(validate_results_data), levels = c(1,0)))
+
+#Converting the Confusing Matrix into table for R-Shiny APP
+
+cm_table <- cm_winloss_logistic$table
+cm_df <- as.data.frame(cm_table)
+
+stats <- cm_winloss_logistic$byClass
+stats_df <- as.data.frame(t(stats))
+
+# Combine the confusion matrix and statistics into a single dataframe (optional)
+#combined_df <- rbind(cm_df, stats_df)
+
+print(combined_df)
+
+#plotting ROC
+library(pROC)
+roc_obj <- roc(validate_results_data, predicted.classes)
+
+# Plot the ROC curve
+plot(roc_obj, main="ROC Curve", col="blue", lwd=2)
+
+#determining margin using logistic regression
+# Checking margin inour final data
+afl_data_final$Margin
+
+#Training the model for margin 
+model2 <- lm(Margin ~ D.Rate, data = afl_data_final)
+summary(model2)
+
+#Training graph
+afl_data_final %>%
+  filter(score != 0.5) %>%
+  ggplot(aes(D.Rate, Margin)) +
+  geom_point(alpha = 0.1) +
+  stat_smooth(method = "lm",
+              se = F)
+
+#Making predictions for margins
+
+for (round in test_data_elo$Round){
+  rounds_check_margin <- test_data_elo %>% filter(Round == Round)
+  predicted.classes_margin <- model2 %>% predict(rounds_check_margin, type = "response")
+  print(paste("Margins for", round))
+  print(predicted.classes_margin)
+}
+
+#rounding margins to one decimal places
+predicted.classes_margin <- round(predicted.classes_margin,0)
+
+#collect_metrics(predicted.classes_margin)
+
+predicted.classes_margin_df <- data.frame(ID = c(1, 2, 3,4,5,6,7,8,9),
+                                          Predicted_MArgin <-as.data.frame(predicted.classes_margin))
+rounds_final_df <-data.frame(ID = c(1, 2, 3,4,5,6,7,8,9),Round =c("QF1",'EF1','EF2','QF2','SF1',
+                                                                  'SF2','PF1','PF2','GF'),Home_Team = test_data_elo$Home.Team,
+                             Away_Team = test_data_elo$Away.Team)
+
+
+
+
+#Final margin table using logistic regression
+final_margin_table <-rounds_final_df %>% inner_join(predicted.classes_margin_df, by = "ID") 
+
+## Compare predicted to actual for margin model
+
+rmse_ellog <- RMSE(predicted.classes_margin_df$predicted.classes_margin, test_data_elo$Margin)
+R2_ellog <- R2(predicted.classes_margin_df$predicted.classes_margin , test_data_elo$Margin)
+
+final_ellog_df <- data.frame(ID=c(1,2),Measures = c('RMSE','R2'), value=c(rmse_ellog,R2_ellog))
+table_df <- data.frame(ID=c(1,2))
+
+final_ellog_table <- final_ellog_df %>% inner_join(table_df)
+
+
+
+-----------------------------------------------------------shiny app------------------------------------------------------\
+# Load necessary libraries
+library(shiny)
+library(fitzRoy)
+library(dplyr)
+library(stringr)
+library(elo)
+library(caret)
+library(ggplot2)
+#library(InformationValue)
+
+# Define the UI
+ui <- fluidPage(
+  titlePanel("AFL-Data Analysis for 2023"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      tags$div(style = "font-size:20px; font-weight:bold;
+               padding:10px; border: 1px solid black; text-align:center;", "ELO & LOGISTIC REGRESSSION PREDICTIONS")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Win-Loss Table", tableOutput("winLossTable")),
+        tabPanel("Margin Table", tableOutput("marginTable")),
+        #tabPanel("Elo Accuracy", verbatimTextOutput("eloAccuracy")),
+        #tabPanel("Logistic Accuracy", verbatimTextOutput("logisticAccuracy")),
+        tabPanel("WinLossGraph", plotOutput("graph")),
+        tabPanel("Win-Loss Accuracy", tableOutput("winlossAccuracy")),
+        tabPanel("Margin Accuracy", tableOutput("marginAccuracy")),
+        tabPanel("MarginGraph", plotOutput("graph2"))
+      )
+    )
+  )
+)
+
+# Define server logic
+server <- function(input, output) {
+  
+  # Since there are multiple outputs, use reactive function for chunks of codes that are reused
+  fetchData <- reactive({
+    # Your initial data processing code here...
+    # (everything up to eloratings$pred_elo <- ifelse(eloratings$p.A > 0.5, 1, 0))
+    
+    # Return eloratings
+    return(eloratings_optimal)
+  })
+  
+  output$winLossTable <- renderTable({
+    final_winloss_table 
+  })
+  
+  output$marginTable <- renderTable({
+    final_margin_table 
+  })
+  
+  output$winlossAccuracy <- renderTable({
+    cat("Confusion Matrix:\n")
+    print(cm_df)
+    cat("\n\n")
+    
+    cat("Statistics:\n")
+    print(stats_df)
+  })
+  
+  output$marginAccuracy <- renderTable({
+    final_ellog_table
+    
+  })
+  
+  output$graph <- renderPlot({
+    afl_data_final %>%
+      filter(score != 0.5) %>%
+      ggplot(aes(D.Rate, score)) +
+      geom_point(alpha = 0.1) +
+      stat_smooth(method = "glm",
+                  method.args = list(family = "binomial"),
+                  se = F)
+  })
+  
+  output$graph2 <- renderPlot({
+    afl_data_final %>%
+      filter(score != 0.5) %>%
+      ggplot(aes(D.Rate, Margin)) +
+      geom_point(alpha = 0.1) +
+      stat_smooth(method = "lm",
+                  se = F)
+  })
+  
+  
+}
+
+# Run the application 
+shinyApp(ui = ui, server = server)
